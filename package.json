@@ -1,0 +1,21 @@
+{
+  "name": "buck-ads",
+  "version": "1.0.0",
+  "description": "Google Ads campaign automation CLI with safety-first guards",
+  "keywords": ["pi-package"],
+  "main": "src/cli.js",
+  "pi": {
+    "skills": ["./skills"]
+  },
+  "scripts": {
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "dependencies": {
+    "google-ads-api": "^23.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  }
+}
