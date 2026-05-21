@@ -21,6 +21,18 @@ require('dotenv').config({ path: path.resolve(process.cwd(), '.env') });
 
 const { createCustomer, getCustomerId } = require('./client');
 const { planCampaign, createCampaign, verifyCampaign } = require('./campaign-builder');
+const {
+  queryCampaign,
+  queryAdGroups,
+  queryKeywords,
+  queryAds,
+  querySitelinks,
+  queryAssets,
+  queryNegatives,
+  queryConversionActions,
+  buildReport,
+  formatTextReport,
+} = require('./campaign-analysis');
 
 // ─── Spec Registry ────────────────────────────────────────────────────────────
 
@@ -477,6 +489,83 @@ function cmdNegatives(args) {
     });
 }
 
+async function cmdAnalyzeCampaign(args) {
+  const campaignName = args.campaign;
+  const format = args.format || 'text';
+  const dateRange = args['date-range'] || 'LAST_30_DAYS';
+
+  if (!campaignName) {
+    console.error('Usage: analyze-campaign --campaign="Campaign Name" [--format=json|text] [--date-range=LAST_30_DAYS]');
+    process.exit(1);
+  }
+
+  try {
+    const customer = createCustomer();
+
+    // 1. Resolve campaign
+    console.error(`Gathering data for "${campaignName}"...`);
+    const campaignRows = await customer.query(queryCampaign(campaignName, dateRange));
+    const campaignRow = campaignRows[0] || null;
+
+    if (!campaignRow) {
+      const report = buildReport({
+        campaign: null,
+        adGroups: [], keywords: [], ads: [],
+        sitelinks: [], assets: [], negatives: [], conversionActions: [],
+      });
+      output(report, format);
+      return;
+    }
+
+    // Resolve campaign resource name for subsequent queries
+    const campaignResource = `customers/${getCustomerId()}/campaigns/${campaignRow.campaign.id}`;
+
+    // 2. Run all data queries in parallel
+    const [
+      adGroupRows,
+      keywordRows,
+      adRows,
+      sitelinkRows,
+      assetRows,
+      negativeRows,
+      conversionRows,
+    ] = await Promise.all([
+      customer.query(queryAdGroups(campaignResource, dateRange)).catch((e) => { console.error(`Warning: ad groups query failed: ${e.message}`); return []; }),
+      customer.query(queryKeywords(campaignResource)).catch((e) => { console.error(`Warning: keywords query failed: ${e.message}`); return []; }),
+      customer.query(queryAds(campaignResource)).catch((e) => { console.error(`Warning: ads query failed: ${e.message}`); return []; }),
+      customer.query(querySitelinks(campaignResource)).catch((e) => { console.error(`Warning: sitelinks query failed: ${e.message}`); return []; }),
+      customer.query(queryAssets(campaignResource)).catch((e) => { console.error(`Warning: assets query failed: ${e.message}`); return []; }),
+      customer.query(queryNegatives(campaignResource)).catch((e) => { console.error(`Warning: negatives query failed: ${e.message}`); return []; }),
+      customer.query(queryConversionActions()).catch((e) => { console.error(`Warning: conversions query failed: ${e.message}`); return []; }),
+    ]);
+
+    // 3. Build and output report
+    const report = buildReport({
+      campaign: campaignRow,
+      adGroups: adGroupRows,
+      keywords: keywordRows,
+      ads: adRows,
+      sitelinks: sitelinkRows,
+      assets: assetRows,
+      negatives: negativeRows,
+      conversionActions: conversionRows,
+    });
+
+    output(report, format);
+  } catch (err) {
+    console.error('Error:', err.message);
+    process.exit(1);
+  }
+}
+
+function output(report, format) {
+  if (format === 'json') {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(formatTextReport(report));
+  }
+}
+
 // ─── CLI Parser ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -521,6 +610,9 @@ switch (command) {
   case 'verify-campaign':
     cmdVerifyCampaign(args);
     break;
+  case 'analyze-campaign':
+    cmdAnalyzeCampaign(args);
+    break;
   default:
     console.log('buck-ads — Google Ads CLI\n');
     console.log('Commands:');
@@ -532,6 +624,8 @@ switch (command) {
     console.log('  create-campaign-from-spec --template=X [--dry-run] [--budget-resource=X]');
     console.log('                                    Create campaign from spec (dry-run by default)');
     console.log('  verify-campaign --campaign="Name"  Verify campaign settings');
+    console.log('  analyze-campaign --campaign="Name" [--format=json|text] [--date-range=LAST_30_DAYS]');
+    console.log('                                    Campaign readiness analysis');
     console.log();
     console.log('Options:');
     console.log('  --specs-dir=Path   Load specs from a custom directory (default: ./specs)');

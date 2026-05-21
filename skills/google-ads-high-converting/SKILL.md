@@ -1,9 +1,9 @@
 ---
 name: google-ads-high-converting
 description: "Build high-converting Google Ads Search campaigns. Covers campaign diagnosis, keyword research by intent tier, negative keyword categorization, RSA ad copy strategies, and live campaign restructure via the Google Ads API. Use when asked to create, optimize, or restructure a Google Ads campaign for conversion performance, research keywords, audit an underperforming campaign, or build ad copy that converts."
-version: 1
+version: 2
 created: 2026-05-19
-updated: 2026-05-19
+updated: 2026-05-21
 ---
 
 # High-Converting Google Ads Campaign Builder
@@ -24,13 +24,13 @@ Before touching any keywords, run these queries:
 
 ```bash
 # 1. List campaigns — check spend, clicks, conversions
-node src/cli.js campaigns
+buck-ads campaigns
 
 # 2. Search terms report — see what's actually triggering
-node src/cli.js search-terms --min-cost=0
+buck-ads search-terms --min-cost=0
 
 # 3. Check negatives coverage
-node src/cli.js negatives --campaign="Campaign Name"
+buck-ads negatives --campaign="Campaign Name"
 
 # 4. Pull full ad group/keyword structure (see Phase 5 for API pattern)
 ```
@@ -160,11 +160,11 @@ Negative keywords prevent your ad from showing on irrelevant searches. This is T
 
 ```bash
 # 1. Pull search terms sorted by cost
-node src/cli.js search-terms --min-cost=0.20
+buck-ads search-terms --min-cost=0.20
 
 # 2. For each term with cost > $0.50 and 0 conversions → assess category
 # 3. Add as negative (skips duplicates automatically)
-node src/cli.js add-negatives \
+buck-ads add-negatives \
   --campaign="Campaign Name" \
   --keywords="kw1,kw2,kw3" \
   --match-type=PHRASE
@@ -264,7 +264,9 @@ for (const d of descriptions) {
 
 ### Google Ads API Mutation Pattern
 
-When restructuring an existing campaign via the API (using `google-ads-api` npm package):
+> **Note:** The JS patterns below are reference material for the API semantics. The `buck-ads` CLI is implemented in **Ruby** (`google-ads-googleads` gem). Campaign builder mutations (Phase 4) will use the Ruby gem when implemented. For CLI operations, use `buck-ads` commands shown above.
+
+When restructuring an existing campaign via the API (using `google-ads-googleads` Ruby gem or `google-ads-api` npm package):
 
 ```javascript
 const { enums, resources } = require('google-ads-api');
@@ -378,7 +380,7 @@ await customer.mutateResources(ops);
 ### Step 1: Add Negatives First
 Negatives are the safest mutation — they only PREVENT spend, never create it.
 ```bash
-node src/cli.js add-negatives \
+buck-ads add-negatives \
   --campaign="Campaign Name" \
   --keywords="waste,terms,here" \
   --match-type=PHRASE
@@ -406,7 +408,7 @@ await customer.mutateResources(allOperations);
 
 ### Step 4: Verify (Before Enabling)
 ```bash
-node src/cli.js campaigns
+buck-ads campaigns
 # Confirm new ad groups exist
 # Confirm old ad groups are PAUSED
 # Confirm negatives count increased
@@ -467,4 +469,4 @@ A: Negatives are negative costs. Every dollar you prevent from being spent on a 
 A: Find one. What do your best customers say when asked why they chose you? Price? Service? Feature? If nothing else, "cheaper than [established player]" works — see Competitor Alternatives ad group pattern.
 
 **Q: How do I handle the "too long" RSA error?**
-A: Always pre-validate. Headlines ≤ 30 chars. Descriptions ≤ 90 chars. Count characters (not words). Cut filler words ("and", "that", "just") before cutting substance. Test with `node -e "console.log('text'.length)"`.
+A: Always pre-validate. Headlines ≤ 30 chars. Descriptions ≤ 90 chars. Count characters (not words). Cut filler words ("and", "that", "just") before cutting substance. Test with `ruby -e "puts 'text'.length"`.

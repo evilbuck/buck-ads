@@ -1,0 +1,377 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# buck-ads — Google Ads CLI for campaign management.
+#
+# Commands:
+#   campaigns                         List all campaigns with metrics
+#   search-terms [--min-cost=X] [--campaign=X]  Get search terms report
+#   negatives --campaign="Name"        List negative keywords
+#   add-negatives --campaign="Name" --keywords="kw1,kw2"
+#   analyze-campaign --campaign="Name" [--format=json|text] [--date-range=LAST_30_DAYS]
+#
+# @example
+#   bundle exec exe/buck-ads campaigns
+#   bundle exec exe/buck-ads analyze-campaign --campaign="business-purchase-us"
+
+require 'dotenv'
+Dotenv.load(File.join(__dir__, '..', '.env'))
+
+$LOAD_PATH.unshift File.expand_path('../lib', __dir__)
+require 'buck_ads'
+
+module BuckAds
+  class CLI
+    def initialize(argv)
+      @argv = argv.dup
+      @command = @argv.shift
+      @args = parse_args(@argv)
+    end
+
+    def run
+      case @command
+      when 'campaigns'
+        cmd_campaigns
+      when 'search-terms'
+        cmd_search_terms
+      when 'negatives'
+        cmd_negatives
+      when 'add-negatives'
+        cmd_add_negatives
+      when 'analyze-campaign'
+        cmd_analyze_campaign
+      else
+        print_help
+      end
+    end
+
+    private
+
+    def parse_args(argv)
+      args = {}
+      argv.each do |arg|
+        next unless arg.start_with?('--')
+
+        key, *value_parts = arg.delete_prefix('--').split('=')
+        args[key.tr('-', '_').to_sym] = value_parts.join('=').then { |v| v.empty? ? true : v }
+      end
+      args
+    end
+
+    def client
+      @client ||= BuckAds::Client.create_client
+    end
+
+    def customer_id
+      @customer_id ||= BuckAds::Client.customer_id
+    end
+
+    def google_ads_service
+      @google_ads_service ||= client.service.google_ads
+    end
+
+    def micros_to_dollars(micros)
+      (micros || 0) / 1_000_000.0
+    end
+
+    # ─── Commands ─────────────────────────────────────────────────────────
+
+    def cmd_campaigns
+      query = <<~GAQL
+        SELECT
+          campaign.id,
+          campaign.name,
+          campaign.status,
+          campaign.advertising_channel_type,
+          metrics.cost_micros,
+          metrics.clicks,
+          metrics.impressions,
+          metrics.all_conversions
+        FROM campaign
+        ORDER BY metrics.cost_micros DESC
+      GAQL
+
+      response = google_ads_service.search(customer_id: customer_id, query: query)
+
+      rows = response.to_a
+      if rows.empty?
+        puts 'No campaigns found.'
+        return
+      end
+
+      header = format('%-50s %-12s %10s %8s %6s', 'Campaign Name', 'Status', 'Cost', 'Clicks', 'Conv')
+      puts "\n#{header}"
+      puts '-' * 90
+
+      rows.each do |row|
+        c = row.campaign
+        m = row.metrics || OpenStruct.new
+        cost = format('$%.2f', micros_to_dollars(m.cost_micros))
+        clicks = m.clicks || 0
+        conv = m.all_conversions || 0
+
+        puts format("%-50s %-12s %10s %8s %6s",
+                     c.name.to_s[0..47],
+                     c.status.to_s,
+                     cost,
+                     clicks.to_s,
+                     conv.to_s)
+      end
+      puts
+    rescue Google::Ads::GoogleAds::Errors::GoogleAdsError => e
+      $stderr.puts "Error fetching campaigns: #{format_ads_error(e)}"
+      exit 1
+    end
+
+    def cmd_search_terms
+      min_cost = @args[:min_cost] ? Float(@args[:min_cost]) : 0.0
+      campaign_filter = if @args[:campaign]
+                          escaped = @args[:campaign].gsub("'", "\\\\'")
+                          "AND campaign.name LIKE '%#{escaped}%'"
+                        else
+                          ''
+                        end
+
+      query = <<~GAQL
+        SELECT
+          campaign.name,
+          ad_group.name,
+          search_term_view.search_term,
+          metrics.cost_micros,
+          metrics.clicks,
+          metrics.impressions,
+          metrics.all_conversions
+        FROM search_term_view
+        WHERE segments.date DURING LAST_30_DAYS
+          AND metrics.cost_micros > #{(min_cost * 1_000_000).to_i}
+          #{campaign_filter}
+        ORDER BY metrics.cost_micros DESC
+        LIMIT 200
+      GAQL
+
+      response = google_ads_service.search(customer_id: customer_id, query: query)
+      rows = response.to_a
+
+      if rows.empty?
+        puts 'No search terms found matching criteria.'
+        return
+      end
+
+      header = format('%-40s %-30s %10s %8s %6s', 'Search Term', 'Campaign', 'Cost', 'Clicks', 'Conv')
+      puts "\n#{header}"
+      puts '-' * 100
+
+      waste_candidates = []
+
+      rows.each do |row|
+        term = row.search_term_view&.search_term || ''
+        campaign_name = row.campaign&.name || ''
+        cost = micros_to_dollars(row.metrics&.cost_micros)
+        clicks = row.metrics&.clicks || 0
+        conv = row.metrics&.all_conversions || 0
+
+        puts format('%-40s %-30s %9s %8s %6s',
+                     term.to_s[0..37],
+                     campaign_name.to_s[0..27],
+                     format('$%.2f', cost),
+                     clicks.to_s,
+                     conv.to_s)
+
+        waste_candidates << term if conv.to_f.zero? && cost > 0.5
+      end
+
+      unless waste_candidates.empty?
+        puts "\n⚠️  #{waste_candidates.length} terms with cost > $0.50 and 0 conversions:"
+        waste_candidates.each { |t| puts "   - #{t}" }
+        puts "\nConsider adding these as negative keywords."
+      end
+      puts
+    rescue Google::Ads::GoogleAds::Errors::GoogleAdsError => e
+      $stderr.puts "Error fetching search terms: #{format_ads_error(e)}"
+      exit 1
+    end
+
+    def cmd_negatives
+      campaign_name = @args[:campaign]
+      unless campaign_name
+        $stderr.puts 'Usage: negatives --campaign="Campaign Name"'
+        exit 1
+      end
+
+      campaign_id = resolve_campaign_id(campaign_name)
+      resource = BuckAds::Client.campaign_resource_name(customer_id, campaign_id)
+
+      query = <<~GAQL
+        SELECT campaign_criterion.keyword.text, campaign_criterion.keyword.match_type, campaign_criterion.negative
+        FROM campaign_criterion
+        WHERE campaign_criterion.campaign = '#{resource}'
+          AND campaign_criterion.type = 'KEYWORD'
+      GAQL
+
+      response = google_ads_service.search(customer_id: customer_id, query: query)
+      negatives = response.select { |r| r.campaign_criterion&.negative }
+
+      if negatives.empty?
+        puts "No negative keywords found for \"#{campaign_name}\"."
+        return
+      end
+
+      puts "\nNegative keywords for \"#{campaign_name}\":"
+      negatives.each do |row|
+        kw = row.campaign_criterion&.keyword
+        puts "  - \"#{kw&.text}\" (#{kw&.match_type})"
+      end
+      puts
+    rescue Google::Ads::GoogleAds::Errors::GoogleAdsError => e
+      $stderr.puts "Error: #{format_ads_error(e)}"
+      exit 1
+    end
+
+    def cmd_add_negatives
+      campaign_name = @args[:campaign]
+      keywords_raw = @args[:keywords]
+
+      unless campaign_name && keywords_raw
+        $stderr.puts 'Usage: add-negatives --campaign="Name" --keywords="kw1,kw2" [--match-type=BROAD|PHRASE|EXACT]'
+        exit 1
+      end
+
+      keywords = keywords_raw.split(',').map(&:strip)
+      match_type = (@args[:match_type] || 'BROAD').upcase
+
+      campaign_id = resolve_campaign_id(campaign_name)
+      resource = BuckAds::Client.campaign_resource_name(customer_id, campaign_id)
+
+      # Check existing negatives
+      existing_query = <<~GAQL
+        SELECT campaign_criterion.keyword.text, campaign_criterion.keyword.match_type
+        FROM campaign_criterion
+        WHERE campaign_criterion.campaign = '#{resource}'
+          AND campaign_criterion.negative = TRUE
+          AND campaign_criterion.type = 'KEYWORD'
+      GAQL
+
+      existing_response = google_ads_service.search(customer_id: customer_id, query: existing_query)
+      existing_set = existing_response.map { |r|
+        "#{r.campaign_criterion.keyword.text.downcase}:#{r.campaign_criterion.keyword.match_type}"
+      }.to_set
+
+      new_keywords = keywords.reject do |kw|
+        key = "#{kw.downcase}:#{match_type}"
+        if existing_set.include?(key)
+          puts "  Skipping duplicate: \"#{kw}\" (#{match_type})"
+          true
+        else
+          false
+        end
+      end
+
+      if new_keywords.empty?
+        puts 'All keywords already exist as negatives. No changes made.'
+        return
+      end
+
+      # Create negative keyword operations
+      campaign_criterion_service = client.service.campaign_criterion
+
+      operations = new_keywords.map do |kw|
+        client.operation.create_resource.campaign_criterion do |cc|
+          cc.campaign = resource
+          cc.negative = true
+          cc.keyword = client.resource.keyword_info do |ki|
+            ki.text = kw
+            ki.match_type = match_type_sym(match_type)
+          end
+        end
+      end
+
+      if @args[:dry_run]
+        puts "🔍 Dry run — would add #{new_keywords.length} negative keyword(s) to \"#{campaign_name}\":"
+        new_keywords.each { |kw| puts "   - \"#{kw}\" (#{match_type})" }
+        return
+      end
+
+      response = campaign_criterion_service.mutate_campaign_criteria(
+        customer_id: customer_id,
+        operations: operations
+      )
+
+      puts "✅ Added #{new_keywords.length} negative keyword(s) to \"#{campaign_name}\":"
+      new_keywords.each { |kw| puts "   - \"#{kw}\" (#{match_type})" }
+    rescue Google::Ads::GoogleAds::Errors::GoogleAdsError => e
+      $stderr.puts "Error adding negatives: #{format_ads_error(e)}"
+      exit 1
+    end
+
+    def cmd_analyze_campaign
+      require_relative '../lib/buck_ads/campaign_analysis'
+
+      campaign_name = @args[:campaign]
+      fmt = @args[:format] || 'text'
+      date_range = @args[:date_range] || 'LAST_30_DAYS'
+
+      unless campaign_name
+        $stderr.puts 'Usage: analyze-campaign --campaign="Campaign Name" [--format=json|text] [--date-range=LAST_30_DAYS]'
+        exit 1
+      end
+
+      $stderr.puts "Gathering data for \"#{campaign_name}\"..."
+      report = BuckAds::CampaignAnalysis.analyze(client, customer_id, campaign_name, date_range: date_range)
+
+      if fmt == 'json'
+        puts JSON.pretty_generate(report)
+      else
+        puts BuckAds::TextFormatter.format_report(report)
+      end
+    rescue Google::Ads::GoogleAds::Errors::GoogleAdsError => e
+      $stderr.puts "Error: #{format_ads_error(e)}"
+      exit 1
+    end
+
+    # ─── Helpers ──────────────────────────────────────────────────────────
+
+    def resolve_campaign_id(campaign_name)
+      escaped = campaign_name.gsub("'", "\\\\'")
+      query = "SELECT campaign.id, campaign.name FROM campaign WHERE campaign.name = '#{escaped}'"
+      response = google_ads_service.search(customer_id: customer_id, query: query)
+      row = response.first
+      raise "Campaign \"#{campaign_name}\" not found" unless row
+
+      row.campaign.id
+    rescue Google::Ads::GoogleAds::Errors::GoogleAdsError => e
+      raise "Error resolving campaign: #{format_ads_error(e)}"
+    end
+
+    def match_type_sym(type)
+      case type
+      when 'BROAD' then :BROAD
+      when 'PHRASE' then :PHRASE
+      when 'EXACT' then :EXACT
+      else :BROAD
+      end
+    end
+
+    def format_ads_error(error)
+      if error.respond_to?(:failure) && error.failure
+        error.failure.errors.map(&:message).join('; ')
+      else
+        error.message
+      end
+    end
+
+    def print_help
+      puts 'buck-ads — Google Ads CLI'
+      puts
+      puts 'Commands:'
+      puts '  campaigns                                 List all campaigns with metrics'
+      puts '  search-terms [--min-cost=X] [--campaign=X] Get search terms report'
+      puts '  negatives --campaign="Name"                List negative keywords'
+      puts '  add-negatives --campaign="Name" --keywords="kw1,kw2"  Add negatives'
+      puts '  analyze-campaign --campaign="Name" [--format=json|text] [--date-range=LAST_30_DAYS]'
+      puts '                                            Campaign readiness analysis'
+      puts
+    end
+  end
+end
+
+BuckAds::CLI.new(ARGV).run

@@ -3,3 +3,6 @@ node_modules
 .pi/.gitnexus/
 .context/workflow/current-session.json
 .claude/skills/gitnexus
+
+# Ruby
+Gemfile.lock
