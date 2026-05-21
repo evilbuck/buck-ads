@@ -1,3 +1,5 @@
 node_modules
 .env
 .pi/.gitnexus/
+.context/workflow/current-session.json
+.claude/skills/gitnexus
