@@ -368,7 +368,7 @@ await customer.mutateResources(ops);
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `Too long.` | RSA description > 90 chars or headline > 30 | Check char length before submitting |
-| `padEnd is not a function` | `campaign.status` is enum number, not string | Wrap with `String(c.status \|\| '')` |
+| `padEnd is not a function` | `campaign.status` is enum number, not string | Wrap with `String(c.status || '')` |
 | `Error: undefined` | `campaign_criterion.campaign` given display name instead of resource name | Resolve campaign name → `customers/{cid}/campaigns/{id}` first |
 | `Resource name is malformed` | Used wrong resource name format for ad_group_ad | Format is `customers/{cid}/adGroupAds/{ag_id}~{ad_id}` |
 | `Error in WHERE clause: invalid value` | Used SQL-style subquery that google-ads-api doesn't support | Use separate queries or full resource names |
